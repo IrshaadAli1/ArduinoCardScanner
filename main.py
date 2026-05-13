@@ -1,80 +1,141 @@
 from dataclasses import dataclass
-import serial_asyncio
 import sys
-from PySide6.QtWidgets import QApplication, QTreeWidgetItem, QWidget
-from PySide6 import QtAsyncio
+from datetime import datetime
+
+from PySide6.QtWidgets import QApplication, QTreeWidgetItem
+from PySide6.QtCore import QObject, Slot, QIODeviceBase
+from PySide6.QtSerialPort import QSerialPort, QSerialPortInfo
 
 from gui import GUI
 from card import Card, Record
-from datetime import datetime
 
 
 @dataclass
 class TreeItemContainer:
     Widget: QTreeWidgetItem
-    Children: dict[int, TreeItemContainer]
+    Children: dict
 
 
-class Run:
+class Run(QObject):
     def __init__(self):
+        super().__init__()
+
         self.Active = False
         self.Cards = {}
         self.CardTreeItems = {}
 
-        self.Writer = self.Reader = None
+        self.serial: QSerialPort = None
+        self.buffer = b""
 
         self.app = QApplication(sys.argv)
         self.UI = GUI()
 
     def run(self):
         self.UI.show()
-        QtAsyncio.run(self.runSerial())
+        self.setupSerial()
+        sys.exit(self.app.exec())
 
+    def setupSerial(self):
 
-    async def handleCard(self, uid):
+        for port in QSerialPortInfo.availablePorts():
+
+            print(port.portName(), port.description())
+
+            if "Arduino" in port.description():
+                self.serial = QSerialPort()
+                self.serial.setPort(port)
+
+                break
+
+        if self.serial is None:
+            print("Serial Port not found")
+            return
+
+        self.serial.setBaudRate(QSerialPort.BaudRate.Baud9600)
+        self.serial.readyRead.connect(self.readSerial)
+
+        if not self.serial.open(QIODeviceBase.OpenModeFlag.ReadOnly):
+            print("Failed to open serial port - Maybe another program is currently running the port?")
+            return
+
+        self.Active = True
+
+        print("Serial connected")
+
+    def handleCard(self, uid):
         if uid not in self.Cards:
             self.Cards[uid] = Card(uid, {})
-            self.CardTreeItems[uid] = TreeItemContainer(QTreeWidgetItem(self.UI.LogTree.Tree, [uid]), {})
+            self.CardTreeItems[uid] = TreeItemContainer(
+                QTreeWidgetItem(self.UI.LogTree.Tree, [uid]),
+                {}
+            )
 
         return self.Cards[uid]
 
-
-    async def handleData(self, data: dict):
+    def handleData(self, data: dict):
         UID = data["UID"]
-        card = await self.handleCard(UID)
+
+        card = self.handleCard(UID)
+
         dateTime = datetime.now()
+
         for recordID, record in data["Records"].items():
-            record = Record(record["Type"], record["Content"], dateTime)
+
+            record = Record(
+                record["Type"],
+                record["Content"],
+                dateTime
+            )
+
             card.addRecord(recordID, record)
 
             cardTree = self.CardTreeItems[UID]
+
             if record.Date not in cardTree.Children:
-                dateTree = TreeItemContainer(QTreeWidgetItem(cardTree.Widget, [str(record.Date) + (f" ({record.Date - list(cardTree.Children.keys())[-1]})" if len(cardTree.Children) > 0 else "")]), {})
+
+                deltaText = ""
+
+                if len(cardTree.Children) > 0:
+                    previous = list(cardTree.Children.keys())[-1]
+                    deltaText = f" ({record.Date - previous})"
+
+                dateTree = TreeItemContainer(
+                    QTreeWidgetItem(
+                        cardTree.Widget,
+                        [str(record.Date) + deltaText]
+                    ),
+                    {}
+                )
+
                 cardTree.Children[record.Date] = dateTree
+
             dateTree = cardTree.Children[record.Date]
-            dateTree.Children[recordID] = QTreeWidgetItem(dateTree.Widget, [recordID, record.Type, record.Content])
 
-    async def runSerial(self):
-        self.Active = True
+            dateTree.Children[recordID] = QTreeWidgetItem(
+                dateTree.Widget,
+                [recordID, record.Type, record.Content]
+            )
 
-        try:
-            self.Reader, self.Writer = await serial_asyncio.open_serial_connection(url="COM5", baudrate=9600)
-            while self.Active:
-                data = await self.Reader.readline()
-                if data == "": continue
-                line = data.decode("utf-8").strip()
-                try:
-                    evalData = eval(line)
-                    print(evalData)
-                    await self.handleData(evalData)
-                except Exception as e:
-                    print(e)
-                print(line)
+    @Slot()
+    def readSerial(self):
 
-            self.Writer.close()
-            await self.Writer.wait_closed()
-        except Exception as e:
-            self.Active = False
+        while self.serial.canReadLine():
+
+            line = self.serial.readLine().data()
+            print(line)
+            try:
+                decoded = line.decode("utf-8").strip()
+
+                if not decoded:
+                    print(decoded, "is not decoded - Continuing")
+                    continue
+
+                evalData = eval(decoded)
+
+                self.handleData(evalData)
+
+            except Exception as e:
+                print(e)
 
 if __name__ == "__main__":
     Run().run()
